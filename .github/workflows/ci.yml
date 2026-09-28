@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l $(find . -type f -name '*.go' -not -path './vendor/*'))"
+          if [ -n "$unformatted" ]; then
+            echo "The following Go files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: go build ./...
+
+      # Fails when code reachable from this module calls a symbol with a known
+      # advisory. Pinned tool version; never run with GOFLAGS=-mod=mod.
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
