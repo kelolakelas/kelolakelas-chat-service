@@ -105,6 +105,10 @@ func routes(handler http.Handler) *http.ServeMux {
 	if handler != nil {
 		mux.Handle("/api/v1/chat/conversations", handler)
 		mux.Handle("/api/v1/chat/conversations/", handler)
+		// WS realtime (KEL-121): ticket issue and ticket-authenticated upgrade
+		// share the chat handler's routing, multiplexed inside ServeHTTP.
+		mux.Handle("/api/v1/chat/ws-tickets", handler)
+		mux.Handle("/api/v1/chat/ws", handler)
 	}
 	return mux
 }
@@ -183,6 +187,17 @@ func main() {
 		os.Exit(1)
 	}
 	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission, Academic: academicClient, Tenant: permission}, Secret: cfg.JWTSecret}
+	// WS realtime (KEL-121): a process-local ticket store paired with an
+	// in-memory fan-out hub. serveUntilDone's graceful shutdown races the
+	// pump close frames; a dedicated hub.Close on shutdown gives WS clients
+	// the normal-close code the contract requires.
+	hub := chat.NewWSHub()
+	tickets := chat.NewTicketStore()
+	handler.Tickets = tickets
+	handler.Hub = hub
+	handler.Service.Hub = hub
+	stopHub := context.AfterFunc(ctx, func() { hub.Close() })
+	defer stopHub()
 	server := newHTTPServer(cfg, routes(handler))
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {

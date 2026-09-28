@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -16,6 +17,14 @@ import (
 type Handler struct {
 	Service chat.Service
 	Secret  string
+	// Tickets mints single-use WS tickets; Hub fans out realtime events.
+	// Both are wired by main. Conversation routes work when they are nil,
+	// but the WS routes answer 500 until they are set.
+	Tickets *chat.TicketStore
+	Hub     *chat.WSHub
+	// wsParams overrides connection liveness in tests. The zero value selects
+	// the production defaults at serve time, so main never sets it.
+	wsParams *wsParams
 }
 type claims struct {
 	UserID   string `json:"user_id"`
@@ -51,10 +60,21 @@ func parseID(raw string) (uuid.UUID, error) {
 	return id, nil
 }
 func (h Handler) authenticate(w http.ResponseWriter, r *http.Request) (chat.Actor, bool) {
-	parts := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || h.Secret == "" {
+	a, _, ok := h.parseAuth(r)
+	if !ok {
 		respond(w, 401, "Invalid or expired token", nil)
 		return chat.Actor{}, false
+	}
+	return a, true
+}
+
+// parseAuth validates the JWT and returns the actor plus the token expiry,
+// so derived credentials (WS tickets) can be bound to the token lifetime.
+func (h Handler) parseAuth(r *http.Request) (chat.Actor, time.Time, bool) {
+	zero := chat.Actor{}
+	parts := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || h.Secret == "" {
+		return zero, time.Time{}, false
 	}
 	c := new(claims)
 	token, err := jwt.ParseWithClaims(parts[1], c, func(t *jwt.Token) (any, error) {
@@ -64,8 +84,7 @@ func (h Handler) authenticate(w http.ResponseWriter, r *http.Request) (chat.Acto
 		return []byte(h.Secret), nil
 	})
 	if err != nil || !token.Valid || c.UserID == "" || (!c.IsParent && c.TenantID == "") {
-		respond(w, 401, "Invalid or expired token", nil)
-		return chat.Actor{}, false
+		return zero, time.Time{}, false
 	}
 	user, e1 := parseID(c.UserID)
 	tenant := uuid.Nil
@@ -74,8 +93,7 @@ func (h Handler) authenticate(w http.ResponseWriter, r *http.Request) (chat.Acto
 	if c.TenantID != "" {
 		tenant, e1 = uuid.Parse(c.TenantID)
 		if e1 != nil {
-			respond(w, 401, "Invalid or expired token", nil)
-			return chat.Actor{}, false
+			return zero, time.Time{}, false
 		}
 	}
 	if c.RoleID != "" {
@@ -85,10 +103,13 @@ func (h Handler) authenticate(w http.ResponseWriter, r *http.Request) (chat.Acto
 		member, _ = uuid.Parse(c.MemberID)
 	}
 	if e1 != nil || user == uuid.Nil || (!c.IsParent && tenant == uuid.Nil) {
-		respond(w, 401, "Invalid or expired token", nil)
-		return chat.Actor{}, false
+		return zero, time.Time{}, false
 	}
-	return chat.Actor{UserID: user, TenantID: tenant, RoleID: role, MemberID: member, IsParent: c.IsParent}, true
+	var exp time.Time
+	if raw, err := c.GetExpirationTime(); err == nil && raw != nil {
+		exp = raw.Time
+	}
+	return chat.Actor{UserID: user, TenantID: tenant, RoleID: role, MemberID: member, IsParent: c.IsParent}, exp, true
 }
 func decode(r *http.Request, v any) error {
 	defer r.Body.Close()
@@ -114,6 +135,25 @@ func positive(raw string, def, max int) (int, error) {
 	return n, nil
 }
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// WS realtime routes (KEL-121) dispatch before JWT: the ticket endpoint
+	// authenticates inside issueWSTicket, while serveWS authenticates via
+	// the single-use ticket itself.
+	if r.URL.Path == "/api/v1/chat/ws-tickets" {
+		if r.Method != http.MethodPost {
+			respond(w, 405, "Method not allowed", nil)
+			return
+		}
+		h.issueWSTicket(w, r)
+		return
+	}
+	if r.URL.Path == "/api/v1/chat/ws" {
+		if r.Method != http.MethodGet {
+			respond(w, 405, "Method not allowed", nil)
+			return
+		}
+		h.serveWS(w, r)
+		return
+	}
 	a, ok := h.authenticate(w, r)
 	if !ok {
 		return
