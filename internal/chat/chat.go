@@ -75,6 +75,10 @@ type Service struct {
 	Permission Permission
 	Academic   Academic
 	Tenant     TenantInfo
+	// Hub is the optional in-memory fan-out for WS realtime events. When nil,
+	// Send/Read behave exactly as before (REST only). Wired by main; unit
+	// tests leave it nil.
+	Hub *WSHub
 }
 
 // Visible is the single authorization boundary shared by all conversation operations.
@@ -85,6 +89,15 @@ func (s Service) allowed(ctx context.Context, a Actor, permission string) bool {
 	}
 	ok, err := s.Permission.CheckPermission(ctx, a.TenantID.String(), a.RoleID.String(), a.MemberID.String(), permission)
 	return err == nil && ok
+}
+
+// Rights returns a copy of a with chat:manage/report:read frozen to their
+// current values. WS connections capture rights once at connect time, so the
+// hub fan-out consults the frozen copy instead of calling identity per event.
+func (s Service) Rights(ctx context.Context, a Actor) Actor {
+	a.CanManage = s.allowed(ctx, a, "chat:manage")
+	a.CanReport = s.allowed(ctx, a, "report:read")
+	return a
 }
 func (s Service) Visible(ctx context.Context, a Actor, c Conversation) bool {
 	if a.UserID == uuid.Nil {
@@ -220,10 +233,20 @@ func (s Service) Send(ctx context.Context, a Actor, id uuid.UUID, body, clientID
 	if utf8.RuneCountInString(body) < 1 || utf8.RuneCountInString(body) > 2000 || strings.TrimSpace(clientID) == "" {
 		return Message{}, ErrInvalid
 	}
-	if _, err := s.Get(ctx, a, id); err != nil {
+	c, err := s.Get(ctx, a, id)
+	if err != nil {
 		return Message{}, err
 	}
-	return s.Store.Send(ctx, id, a, body, clientID)
+	m, err := s.Store.Send(ctx, id, a, body, clientID)
+	if err != nil {
+		return Message{}, err
+	}
+	// Fan-out is best-effort: it never fails the REST send it follows, and
+	// the hub delivers only to connections that can see this conversation.
+	if s.Hub != nil {
+		s.Hub.BroadcastMessage(c, m)
+	}
+	return m, nil
 }
 func (s Service) Messages(ctx context.Context, a Actor, id uuid.UUID, before *uuid.UUID, limit int) ([]Message, error) {
 	if _, err := s.Get(ctx, a, id); err != nil {
@@ -232,8 +255,15 @@ func (s Service) Messages(ctx context.Context, a Actor, id uuid.UUID, before *uu
 	return s.Store.Messages(ctx, id, before, limit)
 }
 func (s Service) Read(ctx context.Context, a Actor, id uuid.UUID) error {
-	if _, err := s.Get(ctx, a, id); err != nil {
+	c, err := s.Get(ctx, a, id)
+	if err != nil {
 		return err
 	}
-	return s.Store.Read(ctx, id, a.UserID)
+	if err := s.Store.Read(ctx, id, a.UserID); err != nil {
+		return err
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastRead(c, a.UserID, time.Now())
+	}
+	return nil
 }
