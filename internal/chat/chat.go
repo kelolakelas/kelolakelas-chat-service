@@ -13,10 +13,27 @@ import (
 
 var ErrNotFound = errors.New("conversation not found")
 var ErrInvalid = errors.New("invalid input")
+var ErrUnavailable = errors.New("upstream service unavailable")
+
+type SubjectContext struct {
+	ID, TenantID, ParentID             uuid.UUID
+	ClassName, StudentFirstName, Title string
+}
+type Academic interface {
+	Context(context.Context, string, uuid.UUID) (SubjectContext, error)
+}
+type TenantInfo interface {
+	Name(context.Context, uuid.UUID) (string, error)
+}
+type CreateInput struct {
+	Kind      string
+	SubjectID uuid.UUID
+}
 
 type Actor struct {
 	UserID, TenantID, RoleID, MemberID uuid.UUID
 	IsParent                           bool
+	CanManage, CanReport               bool
 }
 type Conversation struct {
 	ID              uuid.UUID       `json:"id"`
@@ -42,7 +59,7 @@ type Message struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 type Store interface {
-	Create(context.Context, Actor) (Conversation, bool, error)
+	Create(context.Context, Conversation) (Conversation, bool, error)
 	Get(context.Context, uuid.UUID) (Conversation, error)
 	List(context.Context, Actor, int, int) ([]Conversation, error)
 	ListOwner(context.Context, Actor, int, int) ([]Conversation, error)
@@ -56,22 +73,40 @@ type Permission interface {
 type Service struct {
 	Store      Store
 	Permission Permission
+	Academic   Academic
+	Tenant     TenantInfo
 }
 
 // Visible is the single authorization boundary shared by all conversation operations.
 // Membership is checked before any remote authorization request; errors deny access.
-func (s Service) Visible(ctx context.Context, a Actor, c Conversation) bool {
-	if a.IsParent || a.UserID == uuid.Nil || a.TenantID == uuid.Nil || a.TenantID != c.TenantID || c.Kind != "staff" {
+func (s Service) allowed(ctx context.Context, a Actor, permission string) bool {
+	if a.IsParent || a.TenantID == uuid.Nil || a.RoleID == uuid.Nil || a.MemberID == uuid.Nil || s.Permission == nil {
 		return false
 	}
-	if c.MemberUserID != nil && *c.MemberUserID == a.UserID {
+	ok, err := s.Permission.CheckPermission(ctx, a.TenantID.String(), a.RoleID.String(), a.MemberID.String(), permission)
+	return err == nil && ok
+}
+func (s Service) Visible(ctx context.Context, a Actor, c Conversation) bool {
+	if a.UserID == uuid.Nil {
+		return false
+	}
+	if c.Kind != "staff" && c.Kind != "schedule_request" && c.Kind != "report" {
+		return false
+	}
+	if c.Kind != "staff" && a.IsParent {
+		return c.ParentUserID != nil && *c.ParentUserID == a.UserID
+	}
+	if a.IsParent || a.TenantID == uuid.Nil || a.TenantID != c.TenantID {
+		return false
+	}
+	if c.Kind == "staff" && c.MemberUserID != nil && *c.MemberUserID == a.UserID {
 		return true
 	}
-	if a.RoleID == uuid.Nil || a.MemberID == uuid.Nil || s.Permission == nil {
-		return false
+	permission := "chat:manage"
+	if c.Kind == "report" {
+		permission = "report:read"
 	}
-	ok, err := s.Permission.CheckPermission(ctx, a.TenantID.String(), a.RoleID.String(), a.MemberID.String(), "chat:manage")
-	return err == nil && ok
+	return s.allowed(ctx, a, permission)
 }
 func (s Service) Get(ctx context.Context, a Actor, id uuid.UUID) (Conversation, error) {
 	c, err := s.Store.Get(ctx, id)
@@ -83,29 +118,90 @@ func (s Service) Get(ctx context.Context, a Actor, id uuid.UUID) (Conversation, 
 	}
 	return c, nil
 }
-func (s Service) Create(ctx context.Context, a Actor) (Conversation, bool, error) {
-	if a.IsParent || a.TenantID == uuid.Nil || a.MemberID == uuid.Nil || a.UserID == uuid.Nil {
+func (s Service) Create(ctx context.Context, a Actor, input ...CreateInput) (Conversation, bool, error) {
+	if a.UserID == uuid.Nil {
+		return Conversation{}, false, ErrNotFound
+	}
+	request := CreateInput{Kind: "staff"}
+	if len(input) > 0 {
+		request = input[0]
+	}
+	if request.Kind == "staff" {
+		if len(input) > 0 && request.SubjectID != uuid.Nil && request.SubjectID != a.MemberID {
+			return Conversation{}, false, ErrInvalid
+		}
+		if a.IsParent || a.TenantID == uuid.Nil || a.MemberID == uuid.Nil {
+			return Conversation{}, false, ErrInvalid
+		}
+		member := a.UserID
+		return s.Store.Create(ctx, Conversation{TenantID: a.TenantID, Kind: "staff", SubjectID: a.MemberID, MemberUserID: &member, CreatedByUserID: a.UserID, Context: json.RawMessage(`{}`)})
+	}
+	if request.SubjectID == uuid.Nil || (request.Kind != "schedule_request" && request.Kind != "report") {
 		return Conversation{}, false, ErrInvalid
 	}
-	return s.Store.Create(ctx, a)
+	if request.Kind == "report" && a.IsParent {
+		return Conversation{}, false, ErrNotFound
+	}
+	if s.Academic == nil {
+		return Conversation{}, false, ErrUnavailable
+	}
+	source, err := s.Academic.Context(ctx, request.Kind, request.SubjectID)
+	if err != nil {
+		return Conversation{}, false, err
+	}
+	if source.ID != request.SubjectID || source.TenantID == uuid.Nil || source.ParentID == uuid.Nil {
+		return Conversation{}, false, ErrUnavailable
+	}
+	if a.IsParent {
+		if source.ParentID != a.UserID {
+			return Conversation{}, false, ErrNotFound
+		}
+	} else {
+		if a.TenantID == uuid.Nil || a.TenantID != source.TenantID {
+			return Conversation{}, false, ErrNotFound
+		}
+		permission := "chat:manage"
+		if request.Kind == "report" {
+			permission = "report:read"
+		}
+		if !s.allowed(ctx, a, permission) {
+			return Conversation{}, false, ErrNotFound
+		}
+	}
+	if s.Tenant == nil {
+		return Conversation{}, false, ErrUnavailable
+	}
+	name, err := s.Tenant.Name(ctx, source.TenantID)
+	if err != nil {
+		return Conversation{}, false, ErrUnavailable
+	}
+	snapshot, err := json.Marshal(map[string]string{"class_name": source.ClassName, "student_first_name": source.StudentFirstName, "report_title": source.Title, "tenant_name": name})
+	if err != nil {
+		return Conversation{}, false, ErrUnavailable
+	}
+	parent := source.ParentID
+	c, created, err := s.Store.Create(ctx, Conversation{TenantID: source.TenantID, Kind: request.Kind, SubjectID: request.SubjectID, ParentUserID: &parent, CreatedByUserID: a.UserID, Context: snapshot})
+	if err != nil {
+		return c, created, err
+	}
+	// An existing row is returned only if its immutable participants still match the source.
+	if c.ParentUserID == nil || *c.ParentUserID != source.ParentID {
+		return Conversation{}, false, ErrNotFound
+	}
+	return c, created, nil
 }
 func (s Service) List(ctx context.Context, a Actor, page, size int) ([]Conversation, error) {
-	if a.IsParent || a.TenantID == uuid.Nil {
+	if a.UserID == uuid.Nil || (!a.IsParent && a.TenantID == uuid.Nil) {
 		return []Conversation{}, nil
-	}
-	// Owner rows are always visible. A manager can see every row, but identity
-	// failure is treated as a denial rather than a server error.
-	manager := false
-	if a.RoleID != uuid.Nil && a.MemberID != uuid.Nil && s.Permission != nil {
-		ok, err := s.Permission.CheckPermission(ctx, a.TenantID.String(), a.RoleID.String(), a.MemberID.String(), "chat:manage")
-		manager = err == nil && ok
 	}
 	var rows []Conversation
 	var err error
-	if manager {
-		rows, err = s.Store.List(ctx, a, page, size)
-	} else {
+	if a.IsParent {
 		rows, err = s.Store.ListOwner(ctx, a, page, size)
+	} else {
+		a.CanManage = s.allowed(ctx, a, "chat:manage")
+		a.CanReport = s.allowed(ctx, a, "report:read")
+		rows, err = s.Store.List(ctx, a, page, size)
 	}
 	if err != nil {
 		return nil, err

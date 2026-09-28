@@ -16,7 +16,7 @@ import (
 
 type stubStore struct{ c chat.Conversation }
 
-func (s stubStore) Create(context.Context, chat.Actor) (chat.Conversation, bool, error) {
+func (s stubStore) Create(context.Context, chat.Conversation) (chat.Conversation, bool, error) {
 	return s.c, true, nil
 }
 func (s stubStore) Get(context.Context, uuid.UUID) (chat.Conversation, error) { return s.c, nil }

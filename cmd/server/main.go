@@ -20,6 +20,7 @@ import (
 	"github.com/kelolakelas/kelolakelas-chat-service/internal/chat"
 	chathttp "github.com/kelolakelas/kelolakelas-chat-service/internal/delivery/http"
 	"github.com/kelolakelas/kelolakelas-chat-service/internal/postgres"
+	"github.com/kelolakelas/kelolakelas-chat-service/pkg/academic"
 	"github.com/kelolakelas/kelolakelas-chat-service/pkg/grpcclient"
 )
 
@@ -27,16 +28,18 @@ const serviceName = "chat-service"
 
 // config holds the settings the skeleton needs; each later issue extends it.
 type config struct {
-	Port                    string
-	ServerReadHeaderTimeout time.Duration
-	ServerReadTimeout       time.Duration
-	ServerWriteTimeout      time.Duration
-	ServerIdleTimeout       time.Duration
-	ServerShutdownTimeout   time.Duration
-	DatabaseURL             string
-	JWTSecret               string
-	IdentityHost            string
-	PermissionTimeout       time.Duration
+	Port                            string
+	ServerReadHeaderTimeout         time.Duration
+	ServerReadTimeout               time.Duration
+	ServerWriteTimeout              time.Duration
+	ServerIdleTimeout               time.Duration
+	ServerShutdownTimeout           time.Duration
+	DatabaseURL                     string
+	JWTSecret                       string
+	IdentityHost                    string
+	PermissionTimeout               time.Duration
+	AcademicURL, InternalCredential string
+	AcademicTimeout                 time.Duration
 }
 
 func loadConfig(getenv func(string) string) config {
@@ -62,6 +65,7 @@ func loadConfig(getenv func(string) string) config {
 	}
 	return config{
 		DatabaseURL: db, JWTSecret: getenv("JWT_SECRET"), IdentityHost: host, PermissionTimeout: milliseconds(getenv("IDENTITY_PERMISSION_TIMEOUT_MS"), 500),
+		AcademicURL: strings.TrimSpace(getenv("ACADEMIC_SERVICE_URL")), InternalCredential: strings.TrimSpace(getenv("INTERNAL_SERVICE_CREDENTIAL")), AcademicTimeout: milliseconds(getenv("ACADEMIC_TIMEOUT_MS"), 1000),
 		Port:                    port,
 		ServerReadHeaderTimeout: seconds(getenv("SERVER_READ_HEADER_TIMEOUT_SECONDS"), 5),
 		ServerReadTimeout:       seconds(getenv("SERVER_READ_TIMEOUT_SECONDS"), 30),
@@ -173,7 +177,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer permission.Close()
-	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission}, Secret: cfg.JWTSecret}
+	academicClient, err := academic.New(cfg.AcademicURL, cfg.InternalCredential, cfg.AcademicTimeout)
+	if err != nil {
+		slog.Error("academic client configuration invalid")
+		os.Exit(1)
+	}
+	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission, Academic: academicClient, Tenant: permission}, Secret: cfg.JWTSecret}
 	server := newHTTPServer(cfg, routes(handler))
 	listener, err := net.Listen("tcp", server.Addr)
 	if err != nil {
