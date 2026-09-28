@@ -24,7 +24,7 @@ type fakeStore struct {
 	writes int
 }
 
-func (f *fakeStore) Create(_ context.Context, _ Actor) (Conversation, bool, error) {
+func (f *fakeStore) Create(_ context.Context, _ Conversation) (Conversation, bool, error) {
 	return f.c, true, nil
 }
 func (f *fakeStore) Get(_ context.Context, _ uuid.UUID) (Conversation, error) { return f.c, nil }

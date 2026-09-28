@@ -37,6 +37,8 @@ func failure(w http.ResponseWriter, err error) {
 		respond(w, 404, "Conversation not found", nil)
 	case errors.Is(err, chat.ErrInvalid):
 		respond(w, 400, "Invalid request", nil)
+	case errors.Is(err, chat.ErrUnavailable):
+		respond(w, 503, "Upstream service unavailable", nil)
 	default:
 		respond(w, 500, "Internal server error", nil)
 	}
@@ -140,13 +142,28 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			respond(w, 200, "OK", rows)
 		case http.MethodPost:
 			var input struct {
-				Kind string `json:"kind"`
+				Kind      string `json:"kind"`
+				SubjectID string `json:"subject_id"`
 			}
-			if err := decode(r, &input); err != nil || input.Kind != "staff" {
+			if err := decode(r, &input); err != nil || (input.Kind != "staff" && input.Kind != "schedule_request" && input.Kind != "report") {
 				failure(w, chat.ErrInvalid)
 				return
 			}
-			c, created, err := h.Service.Create(ctx, a)
+			subject := uuid.Nil
+			if input.Kind == "staff" {
+				if input.SubjectID != "" {
+					failure(w, chat.ErrInvalid)
+					return
+				}
+			} else {
+				var err error
+				subject, err = parseID(input.SubjectID)
+				if err != nil {
+					failure(w, err)
+					return
+				}
+			}
+			c, created, err := h.Service.Create(ctx, a, chat.CreateInput{Kind: input.Kind, SubjectID: subject})
 			if err != nil {
 				failure(w, err)
 				return

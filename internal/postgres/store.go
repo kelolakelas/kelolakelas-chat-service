@@ -33,34 +33,30 @@ func scanMessage(row scanner) (chat.Message, error) {
 
 const messageColumns = `id,conversation_id,sender_user_id,sender_kind,body,client_message_id,created_at`
 
-func (s Store) Create(ctx context.Context, a chat.Actor) (chat.Conversation, bool, error) {
-	id := uuid.New()
-	c, err := scanConversation(s.DB.QueryRow(ctx, `INSERT INTO conversations (id,tenant_id,kind,subject_id,member_user_id,created_by_user_id)
- VALUES ($1,$2,'staff',$3,$4,$4) ON CONFLICT (tenant_id,kind,subject_id) DO NOTHING RETURNING `+conversationColumns, id, a.TenantID, a.MemberID, a.UserID))
+func (s Store) Create(ctx context.Context, input chat.Conversation) (chat.Conversation, bool, error) {
+	c, err := scanConversation(s.DB.QueryRow(ctx, `INSERT INTO conversations (id,tenant_id,kind,subject_id,parent_user_id,member_user_id,context,created_by_user_id)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (tenant_id,kind,subject_id) DO NOTHING RETURNING `+conversationColumns,
+		uuid.New(), input.TenantID, input.Kind, input.SubjectID, input.ParentUserID, input.MemberUserID, input.Context, input.CreatedByUserID))
 	if err == nil {
 		return c, true, nil
 	}
 	if !errors.Is(err, chat.ErrNotFound) {
 		return c, false, err
 	}
-	c, err = scanConversation(s.DB.QueryRow(ctx, `SELECT `+conversationColumns+` FROM conversations WHERE tenant_id=$1 AND kind='staff' AND subject_id=$2`, a.TenantID, a.MemberID))
+	c, err = scanConversation(s.DB.QueryRow(ctx, `SELECT `+conversationColumns+` FROM conversations WHERE tenant_id=$1 AND kind=$2 AND subject_id=$3`, input.TenantID, input.Kind, input.SubjectID))
 	return c, false, err
 }
 func (s Store) Get(ctx context.Context, id uuid.UUID) (chat.Conversation, error) {
 	return scanConversation(s.DB.QueryRow(ctx, `SELECT `+conversationColumns+` FROM conversations WHERE id=$1`, id))
 }
 func (s Store) List(ctx context.Context, a chat.Actor, page, size int) ([]chat.Conversation, error) {
-	return s.list(ctx, `c.tenant_id=$1 AND c.kind='staff'`, a.TenantID, nil, a.UserID, page, size)
+	return s.list(ctx, `c.tenant_id=$1 AND ((c.kind='staff' AND (c.member_user_id=$2 OR $3::boolean)) OR (c.kind='schedule_request' AND $3::boolean) OR (c.kind='report' AND $4::boolean))`, []any{a.TenantID, a.UserID, a.CanManage, a.CanReport}, a.UserID, page, size)
 }
 func (s Store) ListOwner(ctx context.Context, a chat.Actor, page, size int) ([]chat.Conversation, error) {
-	return s.list(ctx, `c.tenant_id=$1 AND c.kind='staff' AND c.member_user_id=$2`, a.TenantID, &a.UserID, a.UserID, page, size)
+	return s.list(ctx, `c.parent_user_id=$1 AND c.kind IN ('schedule_request','report')`, []any{a.UserID}, a.UserID, page, size)
 }
-func (s Store) list(ctx context.Context, where string, tenant uuid.UUID, owner *uuid.UUID, user uuid.UUID, page, size int) ([]chat.Conversation, error) {
+func (s Store) list(ctx context.Context, where string, args []any, user uuid.UUID, page, size int) ([]chat.Conversation, error) {
 	// Authorization predicate precedes pagination, preventing sparse pages and leaks.
-	args := []any{tenant}
-	if owner != nil {
-		args = append(args, *owner)
-	}
 	userPos := len(args) + 1
 	args = append(args, user)
 	limitPos := len(args) + 1
@@ -111,8 +107,12 @@ func (s Store) Send(ctx context.Context, id uuid.UUID, a chat.Actor, body, clien
 		return chat.Message{}, err
 	}
 	defer tx.Rollback(ctx)
+	sender := "member"
+	if a.IsParent {
+		sender = "parent"
+	}
 	m, err := scanMessage(tx.QueryRow(ctx, `INSERT INTO messages(id,conversation_id,sender_user_id,sender_kind,body,client_message_id)
- VALUES ($1,$2,$3,'member',$4,$5) ON CONFLICT (conversation_id,sender_user_id,client_message_id) DO NOTHING RETURNING `+messageColumns, uuid.New(), id, a.UserID, body, clientID))
+ VALUES ($1,$2,$3,$6,$4,$5) ON CONFLICT (conversation_id,sender_user_id,client_message_id) DO NOTHING RETURNING `+messageColumns, uuid.New(), id, a.UserID, body, clientID, sender))
 	if errors.Is(err, pgx.ErrNoRows) {
 		m, err = scanMessage(tx.QueryRow(ctx, `SELECT `+messageColumns+` FROM messages WHERE conversation_id=$1 AND sender_user_id=$2 AND client_message_id=$3`, id, a.UserID, clientID))
 	} else if err == nil {
