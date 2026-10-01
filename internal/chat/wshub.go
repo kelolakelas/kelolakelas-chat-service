@@ -109,11 +109,15 @@ func visibleFrozen(a Actor, c Conversation) bool {
 	if a.UserID == uuid.Nil {
 		return false
 	}
-	if c.Kind != "staff" && c.Kind != "schedule_request" && c.Kind != "report" {
+	if !conversationKinds[c.Kind] {
 		return false
 	}
 	if c.Kind != "staff" && a.IsParent {
 		return c.ParentUserID != nil && *c.ParentUserID == a.UserID
+	}
+	if c.Kind == "notification" {
+		// Mirrors Service.Visible: notifications are parent-only.
+		return false
 	}
 	if a.IsParent || a.TenantID == uuid.Nil || a.TenantID != c.TenantID {
 		return false

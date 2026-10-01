@@ -14,6 +14,7 @@ import (
 var ErrNotFound = errors.New("conversation not found")
 var ErrInvalid = errors.New("invalid input")
 var ErrUnavailable = errors.New("upstream service unavailable")
+var ErrForbidden = errors.New("operation not allowed")
 
 type SubjectContext struct {
 	ID, TenantID, ParentID             uuid.UUID
@@ -50,13 +51,13 @@ type Conversation struct {
 	UnreadCount     int             `json:"unread_count"`
 }
 type Message struct {
-	ID              uuid.UUID `json:"id"`
-	ConversationID  uuid.UUID `json:"conversation_id"`
-	SenderUserID    uuid.UUID `json:"sender_user_id"`
-	SenderKind      string    `json:"sender_kind"`
-	Body            string    `json:"body"`
-	ClientMessageID string    `json:"client_message_id"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID              uuid.UUID  `json:"id"`
+	ConversationID  uuid.UUID  `json:"conversation_id"`
+	SenderUserID    *uuid.UUID `json:"sender_user_id"`
+	SenderKind      string     `json:"sender_kind"`
+	Body            string     `json:"body"`
+	ClientMessageID string     `json:"client_message_id"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 type Store interface {
 	Create(context.Context, Conversation) (Conversation, bool, error)
@@ -66,6 +67,10 @@ type Store interface {
 	Send(context.Context, uuid.UUID, Actor, string, string) (Message, error)
 	Messages(context.Context, uuid.UUID, *uuid.UUID, int) ([]Message, error)
 	Read(context.Context, uuid.UUID, uuid.UUID) error
+	// Notify inserts an idempotent system message into the tenant+parent
+	// notification conversation, creating that conversation when missing, and
+	// reports whether the message was newly created.
+	Notify(context.Context, uuid.UUID, uuid.UUID, string, string) (Conversation, Message, bool, error)
 }
 type Permission interface {
 	CheckPermission(context.Context, string, string, string, string) (bool, error)
@@ -80,6 +85,11 @@ type Service struct {
 	// tests leave it nil.
 	Hub *WSHub
 }
+
+// conversationKinds lists every conversation kind the service handles. The
+// authorization gates in Service.Visible and visibleFrozen both consult it,
+// so adding a kind to one and forgetting the other is not possible.
+var conversationKinds = map[string]bool{"staff": true, "schedule_request": true, "report": true, "notification": true}
 
 // Visible is the single authorization boundary shared by all conversation operations.
 // Membership is checked before any remote authorization request; errors deny access.
@@ -103,11 +113,16 @@ func (s Service) Visible(ctx context.Context, a Actor, c Conversation) bool {
 	if a.UserID == uuid.Nil {
 		return false
 	}
-	if c.Kind != "staff" && c.Kind != "schedule_request" && c.Kind != "report" {
+	if !conversationKinds[c.Kind] {
 		return false
 	}
 	if c.Kind != "staff" && a.IsParent {
 		return c.ParentUserID != nil && *c.ParentUserID == a.UserID
+	}
+	if c.Kind == "notification" {
+		// System notifications are parent-only: no tenant member sees them
+		// through any path, regardless of chat:manage or report:read.
+		return false
 	}
 	if a.IsParent || a.TenantID == uuid.Nil || a.TenantID != c.TenantID {
 		return false
@@ -237,6 +252,11 @@ func (s Service) Send(ctx context.Context, a Actor, id uuid.UUID, body, clientID
 	if err != nil {
 		return Message{}, err
 	}
+	// Notification conversations are one-way: the parent who can read one
+	// must not be able to reply into it.
+	if c.Kind == "notification" {
+		return Message{}, ErrForbidden
+	}
 	m, err := s.Store.Send(ctx, id, a, body, clientID)
 	if err != nil {
 		return Message{}, err
@@ -266,4 +286,26 @@ func (s Service) Read(ctx context.Context, a Actor, id uuid.UUID) error {
 		s.Hub.BroadcastRead(c, a.UserID, time.Now())
 	}
 	return nil
+}
+
+// NotifyInternal delivers a system message to the parent's notification
+// conversation for one tenant (KEL-154). It is the entry point behind the
+// internal credential boundary, never user JWTs: the caller has already been
+// authenticated as a sibling service. Body and idempotency key validation
+// mirror Send. The hub fan-out fires only for a newly created message, so a
+// replayed idempotency key never re-broadcasts.
+func (s Service) NotifyInternal(ctx context.Context, tenantID, parentUserID uuid.UUID, body, idempotencyKey string) (Message, bool, error) {
+	body = strings.TrimSpace(body)
+	if tenantID == uuid.Nil || parentUserID == uuid.Nil ||
+		utf8.RuneCountInString(body) < 1 || utf8.RuneCountInString(body) > 2000 || strings.TrimSpace(idempotencyKey) == "" {
+		return Message{}, false, ErrInvalid
+	}
+	c, m, created, err := s.Store.Notify(ctx, tenantID, parentUserID, body, idempotencyKey)
+	if err != nil {
+		return Message{}, false, err
+	}
+	if created && s.Hub != nil {
+		s.Hub.BroadcastMessage(c, m)
+	}
+	return m, created, nil
 }

@@ -39,13 +39,16 @@ func (f *fakeStore) Send(_ context.Context, id uuid.UUID, a Actor, body, key str
 		return f.m, nil
 	}
 	f.writes++
-	f.m = Message{ID: uuid.New(), ConversationID: id, SenderUserID: a.UserID, Body: body, ClientMessageID: key}
+	f.m = Message{ID: uuid.New(), ConversationID: id, SenderUserID: &a.UserID, Body: body, ClientMessageID: key}
 	return f.m, nil
 }
 func (f *fakeStore) Messages(_ context.Context, _ uuid.UUID, _ *uuid.UUID, _ int) ([]Message, error) {
 	return nil, nil
 }
 func (f *fakeStore) Read(_ context.Context, _, _ uuid.UUID) error { return nil }
+func (f *fakeStore) Notify(_ context.Context, _, _ uuid.UUID, _, _ string) (Conversation, Message, bool, error) {
+	return Conversation{}, Message{}, false, ErrInvalid
+}
 func TestVisible(t *testing.T) {
 	tenant := uuid.New()
 	owner := Actor{UserID: uuid.New(), TenantID: tenant}

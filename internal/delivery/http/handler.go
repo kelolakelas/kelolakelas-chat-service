@@ -1,6 +1,8 @@
 package chathttp
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,6 +19,10 @@ import (
 type Handler struct {
 	Service chat.Service
 	Secret  string
+	// InternalCredential guards the service-to-service notification write
+	// path (KEL-154). Compared constant-time; empty disables the route
+	// (fail closed) the same way the academic inbound middleware does.
+	InternalCredential string
 	// Tickets mints single-use WS tickets; Hub fans out realtime events.
 	// Both are wired by main. Conversation routes work when they are nil,
 	// but the WS routes answer 500 until they are set.
@@ -46,6 +52,8 @@ func failure(w http.ResponseWriter, err error) {
 		respond(w, 404, "Conversation not found", nil)
 	case errors.Is(err, chat.ErrInvalid):
 		respond(w, 400, "Invalid request", nil)
+	case errors.Is(err, chat.ErrForbidden):
+		respond(w, 403, "Operation not allowed", nil)
 	case errors.Is(err, chat.ErrUnavailable):
 		respond(w, 503, "Upstream service unavailable", nil)
 	default:
@@ -135,6 +143,18 @@ func positive(raw string, def, max int) (int, error) {
 	return n, nil
 }
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Internal service-to-service routes (KEL-154) dispatch before JWT: the
+	// notification write path authenticates with the shared internal
+	// credential, never a user token. The route is not routed through the
+	// API gateway.
+	if r.URL.Path == "/internal/notifications" {
+		if r.Method != http.MethodPost {
+			respond(w, 405, "Method not allowed", nil)
+			return
+		}
+		h.notifyInternal(w, r)
+		return
+	}
 	// WS realtime routes (KEL-121) dispatch before JWT: the ticket endpoint
 	// authenticates inside issueWSTicket, while serveWS authenticates via
 	// the single-use ticket itself.
@@ -285,4 +305,56 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, 404, "Not found", nil)
+}
+
+// internalCredentialOk compares the request credential against the configured
+// one in constant time (port of the academic service's InternalServiceAuth to
+// net/http). An empty configured credential fails closed.
+func internalCredentialOk(expected, provided string) bool {
+	if expected == "" {
+		return false
+	}
+	want := sha256.Sum256([]byte(expected))
+	got := sha256.Sum256([]byte(provided))
+	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
+}
+
+// notifyInternal handles POST /internal/notifications for sibling services.
+// The tenant and parent live in the body (not the path), so a misrouted URL
+// can never put a message into the wrong conversation scope.
+func (h Handler) notifyInternal(w http.ResponseWriter, r *http.Request) {
+	if !internalCredentialOk(h.InternalCredential, r.Header.Get("X-Internal-Service-Credential")) {
+		respond(w, 401, "Invalid internal service credential", nil)
+		return
+	}
+	var input struct {
+		TenantID       string `json:"tenant_id"`
+		ParentUserID   string `json:"parent_user_id"`
+		Body           string `json:"body"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if err := decode(r, &input); err != nil {
+		failure(w, err)
+		return
+	}
+	tenant, err := parseID(input.TenantID)
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	parent, err := parseID(input.ParentUserID)
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	m, created, err := h.Service.NotifyInternal(r.Context(), tenant, parent, input.Body, input.IdempotencyKey)
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	code := 200
+	if created {
+		code = 201
+	}
+	respond(w, code, "OK", m)
 }

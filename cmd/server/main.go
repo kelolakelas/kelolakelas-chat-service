@@ -109,6 +109,10 @@ func routes(handler http.Handler) *http.ServeMux {
 		// share the chat handler's routing, multiplexed inside ServeHTTP.
 		mux.Handle("/api/v1/chat/ws-tickets", handler)
 		mux.Handle("/api/v1/chat/ws", handler)
+		// Internal service-to-service notification write path (KEL-154).
+		// Not routed through the API gateway; authenticated inside the
+		// handler with the shared internal credential.
+		mux.Handle("/internal/notifications", handler)
 	}
 	return mux
 }
@@ -186,7 +190,7 @@ func main() {
 		slog.Error("academic client configuration invalid")
 		os.Exit(1)
 	}
-	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission, Academic: academicClient, Tenant: permission}, Secret: cfg.JWTSecret}
+	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission, Academic: academicClient, Tenant: permission}, Secret: cfg.JWTSecret, InternalCredential: cfg.InternalCredential}
 	// WS realtime (KEL-121): a process-local ticket store paired with an
 	// in-memory fan-out hub. serveUntilDone's graceful shutdown races the
 	// pump close frames; a dedicated hub.Close on shutdown gives WS clients
