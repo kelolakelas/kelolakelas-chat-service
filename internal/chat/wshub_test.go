@@ -62,7 +62,7 @@ func TestWSHubFanoutOnlyToVisible(t *testing.T) {
 	cOutsider, _ := h.Register(outsider)
 	cParent, _ := h.Register(otherParent)
 
-	m := Message{ID: uuid.New(), ConversationID: conv.ID, SenderUserID: manager.UserID, Body: "halo"}
+	m := Message{ID: uuid.New(), ConversationID: conv.ID, SenderUserID: &manager.UserID, Body: "halo"}
 	h.BroadcastMessage(conv, m)
 
 	if ev := mustRecv(t, cOwner); ev.Type != WSEventMessageCreated || ev.Message == nil || ev.Message.Body != "halo" {
@@ -135,6 +135,7 @@ func TestVisibleFrozenParityWithService(t *testing.T) {
 	staff := Conversation{ID: uuid.New(), TenantID: tenant, Kind: "staff", MemberUserID: &member}
 	sched := Conversation{ID: uuid.New(), TenantID: tenant, Kind: "schedule_request", ParentUserID: &parent}
 	report := Conversation{ID: uuid.New(), TenantID: tenant, Kind: "report", ParentUserID: &parent}
+	notification := Conversation{ID: uuid.New(), TenantID: tenant, Kind: "notification", SubjectID: parent, ParentUserID: &parent}
 
 	actors := map[string]Actor{
 		"staff owner":      {UserID: member, TenantID: tenant, RoleID: uuid.New(), MemberID: uuid.New()},
@@ -147,7 +148,7 @@ func TestVisibleFrozenParityWithService(t *testing.T) {
 		"missing role":     {UserID: uuid.New(), TenantID: tenant, MemberID: uuid.New(), CanManage: true, CanReport: true},
 		"anonymous":        {},
 	}
-	convs := map[string]Conversation{"staff": staff, "schedule_request": sched, "report": report}
+	convs := map[string]Conversation{"staff": staff, "schedule_request": sched, "report": report, "notification": notification}
 
 	for cname, conv := range convs {
 		for aname, a := range actors {

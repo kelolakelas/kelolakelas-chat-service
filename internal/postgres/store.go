@@ -53,7 +53,7 @@ func (s Store) List(ctx context.Context, a chat.Actor, page, size int) ([]chat.C
 	return s.list(ctx, `c.tenant_id=$1 AND ((c.kind='staff' AND (c.member_user_id=$2 OR $3::boolean)) OR (c.kind='schedule_request' AND $3::boolean) OR (c.kind='report' AND $4::boolean))`, []any{a.TenantID, a.UserID, a.CanManage, a.CanReport}, a.UserID, page, size)
 }
 func (s Store) ListOwner(ctx context.Context, a chat.Actor, page, size int) ([]chat.Conversation, error) {
-	return s.list(ctx, `c.parent_user_id=$1 AND c.kind IN ('schedule_request','report')`, []any{a.UserID}, a.UserID, page, size)
+	return s.list(ctx, `c.parent_user_id=$1 AND c.kind IN ('schedule_request','report','notification')`, []any{a.UserID}, a.UserID, page, size)
 }
 func (s Store) list(ctx context.Context, where string, args []any, user uuid.UUID, page, size int) ([]chat.Conversation, error) {
 	// Authorization predicate precedes pagination, preventing sparse pages and leaks.
@@ -64,7 +64,7 @@ func (s Store) list(ctx context.Context, where string, args []any, user uuid.UUI
 	sql := fmt.Sprintf(`SELECT c.id,c.tenant_id,c.kind,c.subject_id,c.parent_user_id,c.member_user_id,c.context,c.created_by_user_id,c.created_at,c.last_message_at,
  m.id,m.conversation_id,m.sender_user_id,m.sender_kind,m.body,m.client_message_id,m.created_at,
  (SELECT count(*) FROM messages unread LEFT JOIN conversation_reads r ON r.conversation_id=c.id AND r.user_id=$%d
- WHERE unread.conversation_id=c.id AND unread.sender_user_id<>$%d AND (r.last_read_at IS NULL OR unread.created_at>r.last_read_at))
+ WHERE unread.conversation_id=c.id AND unread.sender_user_id IS DISTINCT FROM $%d::uuid AND (r.last_read_at IS NULL OR unread.created_at>r.last_read_at))
  FROM conversations c LEFT JOIN LATERAL (SELECT id,conversation_id,sender_user_id,sender_kind,body,client_message_id,created_at FROM messages WHERE conversation_id=c.id ORDER BY created_at DESC,id DESC LIMIT 1) m ON true
  WHERE %s ORDER BY c.last_message_at DESC NULLS LAST,c.created_at DESC,c.id DESC LIMIT $%d OFFSET $%d`, userPos, userPos, where, limitPos, limitPos+1)
 	return s.listQuery(ctx, sql, args...)
@@ -90,7 +90,9 @@ func (s Store) listQuery(ctx context.Context, sql string, args ...any) ([]chat.C
 		if mid != nil {
 			m.ID = *mid
 			m.ConversationID = *conversationID
-			m.SenderUserID = *senderID
+			// senderID is NULL for system messages; keep the pointer so the
+			// JSON shape matches the stored row.
+			m.SenderUserID = senderID
 			m.SenderKind = *kind
 			m.Body = *body
 			m.ClientMessageID = *clientID
@@ -157,4 +159,55 @@ func (s Store) Messages(ctx context.Context, id uuid.UUID, before *uuid.UUID, li
 func (s Store) Read(ctx context.Context, id, user uuid.UUID) error {
 	_, err := s.DB.Exec(ctx, `INSERT INTO conversation_reads(conversation_id,user_id,last_read_at) VALUES ($1,$2,now()) ON CONFLICT (conversation_id,user_id) DO UPDATE SET last_read_at=GREATEST(conversation_reads.last_read_at,excluded.last_read_at)`, id, user)
 	return err
+}
+
+// Notify implements the system-message write path (KEL-154). Everything it
+// needs to be safe lives inside one transaction: the notification conversation
+// is scoped to (tenant_id, parent_user_id) by the unique constraint, the
+// message insert is idempotent through the system partial unique index, and
+// both rely on ON CONFLICT so concurrent senders converge on one row without
+// erroring. The DB-level CHECK constraints (participants, subject_id equality)
+// are the last line of defense against a mis-scoped write.
+func (s Store) Notify(ctx context.Context, tenantID, parentUserID uuid.UUID, body, idempotencyKey string) (chat.Conversation, chat.Message, bool, error) {
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return chat.Conversation{}, chat.Message{}, false, err
+	}
+	defer tx.Rollback(ctx)
+	c, err := scanConversation(tx.QueryRow(ctx, `INSERT INTO conversations (id,tenant_id,kind,subject_id,parent_user_id,member_user_id,context,created_by_user_id)
+ VALUES ($1,$2,'notification',$3,$3,NULL,'{}'::jsonb,$3)
+ ON CONFLICT (tenant_id,kind,subject_id) DO UPDATE SET parent_user_id=conversations.parent_user_id
+ RETURNING `+conversationColumns, uuid.New(), tenantID, parentUserID))
+	if err != nil {
+		return chat.Conversation{}, chat.Message{}, false, err
+	}
+	// Defense in depth against a concurrent or historical row that violates
+	// the one-parent scoping: never write into it.
+	if c.Kind != "notification" || c.ParentUserID == nil || *c.ParentUserID != parentUserID || c.SubjectID != parentUserID {
+		return chat.Conversation{}, chat.Message{}, false, chat.ErrInvalid
+	}
+	m, err := scanMessage(tx.QueryRow(ctx, `INSERT INTO messages(id,conversation_id,sender_user_id,sender_kind,body,client_message_id)
+ VALUES ($1,$2,NULL,'system',$3,$4)
+ ON CONFLICT DO NOTHING RETURNING `+messageColumns, uuid.New(), c.ID, body, idempotencyKey))
+	if errors.Is(err, pgx.ErrNoRows) {
+		m, err = scanMessage(tx.QueryRow(ctx, `SELECT `+messageColumns+` FROM messages WHERE conversation_id=$1 AND sender_kind='system' AND client_message_id=$2`, c.ID, idempotencyKey))
+		if err != nil {
+			return chat.Conversation{}, chat.Message{}, false, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return chat.Conversation{}, chat.Message{}, false, err
+		}
+		return c, m, false, nil
+	}
+	if err != nil {
+		return chat.Conversation{}, chat.Message{}, false, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE conversations SET last_message_at=GREATEST(COALESCE(last_message_at,$2),$2) WHERE id=$1`, c.ID, m.CreatedAt)
+	if err != nil {
+		return chat.Conversation{}, chat.Message{}, false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return chat.Conversation{}, chat.Message{}, false, err
+	}
+	return c, m, true, nil
 }

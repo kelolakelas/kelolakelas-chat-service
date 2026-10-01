@@ -33,6 +33,9 @@ func (s stubStore) Messages(context.Context, uuid.UUID, *uuid.UUID, int) ([]chat
 	return []chat.Message{}, nil
 }
 func (s stubStore) Read(context.Context, uuid.UUID, uuid.UUID) error { return nil }
+func (s stubStore) Notify(context.Context, uuid.UUID, uuid.UUID, string, string) (chat.Conversation, chat.Message, bool, error) {
+	return chat.Conversation{}, chat.Message{}, false, chat.ErrInvalid
+}
 
 type down struct{}
 

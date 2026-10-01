@@ -36,12 +36,15 @@ func (s wsStore) ListOwner(_ context.Context, _ chat.Actor, _, _ int) ([]chat.Co
 	return []chat.Conversation{s.c}, nil
 }
 func (s wsStore) Send(_ context.Context, id uuid.UUID, a chat.Actor, body, key string) (chat.Message, error) {
-	return chat.Message{ID: uuid.New(), ConversationID: id, SenderUserID: a.UserID, SenderKind: "member", Body: body, ClientMessageID: key, CreatedAt: time.Now()}, nil
+	return chat.Message{ID: uuid.New(), ConversationID: id, SenderUserID: &a.UserID, SenderKind: "member", Body: body, ClientMessageID: key, CreatedAt: time.Now()}, nil
 }
 func (s wsStore) Messages(_ context.Context, _ uuid.UUID, _ *uuid.UUID, _ int) ([]chat.Message, error) {
 	return nil, nil
 }
 func (s wsStore) Read(_ context.Context, _, _ uuid.UUID) error { return nil }
+func (s wsStore) Notify(_ context.Context, _, _ uuid.UUID, _, _ string) (chat.Conversation, chat.Message, bool, error) {
+	return chat.Conversation{}, chat.Message{}, false, chat.ErrInvalid
+}
 
 func signExp(user, tenant, role, member string, parent bool, exp time.Time) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims{UserID: user, TenantID: tenant, RoleID: role, MemberID: member, IsParent: parent, RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(exp)}})
