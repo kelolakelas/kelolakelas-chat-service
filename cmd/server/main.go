@@ -113,6 +113,7 @@ func routes(handler http.Handler) *http.ServeMux {
 		// Not routed through the API gateway; authenticated inside the
 		// handler with the shared internal credential.
 		mux.Handle("/internal/notifications", handler)
+		mux.Handle("/internal/schedule-request-payment-links", handler)
 	}
 	return mux
 }
