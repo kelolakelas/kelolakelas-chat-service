@@ -48,6 +48,8 @@ func respond(w http.ResponseWriter, code int, message string, data any) {
 }
 func failure(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, chat.ErrPaymentLinkInactive):
+		respond(w, http.StatusConflict, "Payment link is inactive", nil)
 	case errors.Is(err, chat.ErrNotFound):
 		respond(w, 404, "Conversation not found", nil)
 	case errors.Is(err, chat.ErrInvalid):
@@ -147,6 +149,14 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// notification write path authenticates with the shared internal
 	// credential, never a user token. The route is not routed through the
 	// API gateway.
+	if r.URL.Path == "/internal/schedule-request-payment-links" {
+		if r.Method != http.MethodPost {
+			respond(w, 405, "Method not allowed", nil)
+			return
+		}
+		h.scheduleRequestPaymentLink(w, r)
+		return
+	}
 	if r.URL.Path == "/internal/notifications" {
 		if r.Method != http.MethodPost {
 			respond(w, 405, "Method not allowed", nil)
