@@ -114,6 +114,7 @@ func routes(handler http.Handler) *http.ServeMux {
 		// handler with the shared internal credential.
 		mux.Handle("/internal/notifications", handler)
 		mux.Handle("/internal/schedule-request-payment-links", handler)
+		mux.Handle("/internal/private-request-events", handler)
 	}
 	return mux
 }

@@ -313,6 +313,9 @@ func (s Service) List(ctx context.Context, a Actor, page, size int) ([]Conversat
 	return result, nil
 }
 func (s Service) Send(ctx context.Context, a Actor, id uuid.UUID, body, clientID string) (Message, error) {
+	if strings.HasPrefix(clientID, "private-event:") {
+		return Message{}, ErrInvalid
+	}
 	body = strings.TrimSpace(body)
 	if utf8.RuneCountInString(body) < 1 || utf8.RuneCountInString(body) > 2000 || strings.TrimSpace(clientID) == "" {
 		return Message{}, ErrInvalid
