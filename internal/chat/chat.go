@@ -35,6 +35,7 @@ type Actor struct {
 	UserID, TenantID, RoleID, MemberID uuid.UUID
 	IsParent                           bool
 	CanManage, CanReport               bool
+	MembershipInactive                 bool
 }
 type Conversation struct {
 	ID              uuid.UUID       `json:"id"`
@@ -75,9 +76,13 @@ type Store interface {
 type Permission interface {
 	CheckPermission(context.Context, string, string, string, string) (bool, error)
 }
+type Membership interface {
+	CheckActiveMembership(context.Context, string, string) (bool, error)
+}
 type Service struct {
 	Store      Store
 	Permission Permission
+	Membership Membership
 	Academic   Academic
 	Tenant     TenantInfo
 	// Hub is the optional in-memory fan-out for WS realtime events. When nil,
@@ -93,55 +98,103 @@ var conversationKinds = map[string]bool{"staff": true, "schedule_request": true,
 
 // Visible is the single authorization boundary shared by all conversation operations.
 // Membership is checked before any remote authorization request; errors deny access.
-func (s Service) allowed(ctx context.Context, a Actor, permission string) bool {
-	if a.IsParent || a.TenantID == uuid.Nil || a.RoleID == uuid.Nil || a.MemberID == uuid.Nil || s.Permission == nil {
-		return false
+func (s Service) checkPermission(ctx context.Context, a Actor, permission string) (bool, error) {
+	if a.IsParent || a.TenantID == uuid.Nil || a.RoleID == uuid.Nil || a.MemberID == uuid.Nil {
+		return false, nil
+	}
+	if s.Permission == nil {
+		return false, ErrUnavailable
 	}
 	ok, err := s.Permission.CheckPermission(ctx, a.TenantID.String(), a.RoleID.String(), a.MemberID.String(), permission)
-	return err == nil && ok
+	if err != nil {
+		return false, ErrUnavailable
+	}
+	return ok, nil
+}
+func (s Service) allowed(ctx context.Context, a Actor, permission string) bool {
+	ok, _ := s.checkPermission(ctx, a, permission)
+	return ok
+}
+func (s Service) activeMembership(ctx context.Context, a Actor) error {
+	// Production always wires identity's existing membership client. Nil keeps
+	// older in-process fixtures usable without inventing an identity server.
+	if a.IsParent || s.Membership == nil {
+		return nil
+	}
+	if a.UserID == uuid.Nil || a.TenantID == uuid.Nil || a.MemberID == uuid.Nil {
+		return ErrForbidden
+	}
+	ok, err := s.Membership.CheckActiveMembership(ctx, a.TenantID.String(), a.MemberID.String())
+	if err != nil {
+		return ErrUnavailable
+	}
+	if !ok {
+		return ErrForbidden
+	}
+	return nil
 }
 
 // Rights returns a copy of a with chat:manage/report:read frozen to their
 // current values. WS connections capture rights once at connect time, so the
 // hub fan-out consults the frozen copy instead of calling identity per event.
 func (s Service) Rights(ctx context.Context, a Actor) Actor {
+	if s.activeMembership(ctx, a) != nil {
+		a.MembershipInactive = true
+		a.CanManage = false
+		a.CanReport = false
+		return a
+	}
 	a.CanManage = s.allowed(ctx, a, "chat:manage")
 	a.CanReport = s.allowed(ctx, a, "report:read")
 	return a
 }
 func (s Service) Visible(ctx context.Context, a Actor, c Conversation) bool {
+	ok, err := s.visible(ctx, a, c)
+	return err == nil && ok
+}
+func (s Service) visible(ctx context.Context, a Actor, c Conversation) (bool, error) {
 	if a.UserID == uuid.Nil {
-		return false
+		return false, nil
 	}
 	if !conversationKinds[c.Kind] {
-		return false
+		return false, nil
 	}
 	if c.Kind != "staff" && a.IsParent {
-		return c.ParentUserID != nil && *c.ParentUserID == a.UserID
+		return c.ParentUserID != nil && *c.ParentUserID == a.UserID, nil
 	}
 	if c.Kind == "notification" {
 		// System notifications are parent-only: no tenant member sees them
 		// through any path, regardless of chat:manage or report:read.
-		return false
+		return false, nil
 	}
 	if a.IsParent || a.TenantID == uuid.Nil || a.TenantID != c.TenantID {
-		return false
+		return false, nil
+	}
+	if err := s.activeMembership(ctx, a); err != nil {
+		if errors.Is(err, ErrForbidden) {
+			return false, nil
+		}
+		return false, err
 	}
 	if c.Kind == "staff" && c.MemberUserID != nil && *c.MemberUserID == a.UserID {
-		return true
+		return true, nil
 	}
 	permission := "chat:manage"
 	if c.Kind == "report" {
 		permission = "report:read"
 	}
-	return s.allowed(ctx, a, permission)
+	return s.checkPermission(ctx, a, permission)
 }
 func (s Service) Get(ctx context.Context, a Actor, id uuid.UUID) (Conversation, error) {
 	c, err := s.Store.Get(ctx, id)
 	if err != nil {
 		return c, err
 	}
-	if !s.Visible(ctx, a, c) {
+	visible, err := s.visible(ctx, a, c)
+	if err != nil {
+		return Conversation{}, err
+	}
+	if !visible {
 		return Conversation{}, ErrNotFound
 	}
 	return c, nil
@@ -149,6 +202,9 @@ func (s Service) Get(ctx context.Context, a Actor, id uuid.UUID) (Conversation, 
 func (s Service) Create(ctx context.Context, a Actor, input ...CreateInput) (Conversation, bool, error) {
 	if a.UserID == uuid.Nil {
 		return Conversation{}, false, ErrNotFound
+	}
+	if err := s.activeMembership(ctx, a); err != nil {
+		return Conversation{}, false, err
 	}
 	request := CreateInput{Kind: "staff"}
 	if len(input) > 0 {
@@ -192,7 +248,11 @@ func (s Service) Create(ctx context.Context, a Actor, input ...CreateInput) (Con
 		if request.Kind == "report" {
 			permission = "report:read"
 		}
-		if !s.allowed(ctx, a, permission) {
+		allowed, err := s.checkPermission(ctx, a, permission)
+		if err != nil {
+			return Conversation{}, false, err
+		}
+		if !allowed {
 			return Conversation{}, false, ErrNotFound
 		}
 	}
@@ -222,13 +282,22 @@ func (s Service) List(ctx context.Context, a Actor, page, size int) ([]Conversat
 	if a.UserID == uuid.Nil || (!a.IsParent && a.TenantID == uuid.Nil) {
 		return []Conversation{}, nil
 	}
+	if err := s.activeMembership(ctx, a); err != nil {
+		return nil, err
+	}
 	var rows []Conversation
 	var err error
 	if a.IsParent {
 		rows, err = s.Store.ListOwner(ctx, a, page, size)
 	} else {
-		a.CanManage = s.allowed(ctx, a, "chat:manage")
-		a.CanReport = s.allowed(ctx, a, "report:read")
+		a.CanManage, err = s.checkPermission(ctx, a, "chat:manage")
+		if err != nil {
+			return nil, err
+		}
+		a.CanReport, err = s.checkPermission(ctx, a, "report:read")
+		if err != nil {
+			return nil, err
+		}
 		rows, err = s.Store.List(ctx, a, page, size)
 	}
 	if err != nil {
@@ -237,7 +306,7 @@ func (s Service) List(ctx context.Context, a Actor, page, size int) ([]Conversat
 	// Defense in depth: every returned row uses the same visibility rule.
 	result := make([]Conversation, 0, len(rows))
 	for _, row := range rows {
-		if s.Visible(ctx, a, row) {
+		if visibleFrozen(a, row) {
 			result = append(result, row)
 		}
 	}
