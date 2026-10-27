@@ -67,6 +67,7 @@ jobs:
         run: go test -race -count=1 ./...
         env:
           KEL223_TEST_DATABASE_URL: postgres://keltest:keltest@localhost:5432/kel223_test?sslmode=disable
+          KEL226_TEST_DATABASE_URL: postgres://keltest:keltest@localhost:5432/kel223_test?sslmode=disable
 
       - name: Build
         run: go build ./...

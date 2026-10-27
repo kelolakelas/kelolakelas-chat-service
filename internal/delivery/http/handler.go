@@ -149,6 +149,14 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// notification write path authenticates with the shared internal
 	// credential, never a user token. The route is not routed through the
 	// API gateway.
+	if r.URL.Path == "/internal/private-request-events" {
+		if r.Method != http.MethodPost {
+			respond(w, 405, "Method not allowed", nil)
+			return
+		}
+		h.privateLifecycle(w, r)
+		return
+	}
 	if r.URL.Path == "/internal/schedule-request-payment-links" {
 		if r.Method != http.MethodPost {
 			respond(w, 405, "Method not allowed", nil)
