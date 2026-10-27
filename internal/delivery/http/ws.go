@@ -1,6 +1,7 @@
 package chathttp
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -108,7 +109,16 @@ func (h Handler) serveWS(w http.ResponseWriter, r *http.Request) {
 	if h.wsParams != nil {
 		params = *h.wsParams
 	}
-	pumpWSConn(conn, sub, tokenExp, params)
+	pumpWSConn(conn, sub, tokenExp, params, func(payload []byte) bool {
+		var event chat.WSEvent
+		if json.Unmarshal(payload, &event) != nil {
+			return false
+		}
+		// Connect-time rights remain a ceiling. Recheck the resource before
+		// writing a queued frame so revoked access cannot leak through an old WS.
+		_, err := h.Service.Get(r.Context(), actor, event.ConversationID)
+		return err == nil
+	})
 }
 
 // pumpWSConn relays hub events to one connection and enforces liveness:
@@ -116,7 +126,7 @@ func (h Handler) serveWS(w http.ResponseWriter, r *http.Request) {
 // and close at the 30-minute lifetime. Inbound frames are drained (and
 // discarded) up to 4 KB so a client cannot stall the socket; any content
 // besides pong is ignored because the socket is server-to-client only.
-func pumpWSConn(conn *websocket.Conn, sub *chat.WSConnection, tokenExp time.Time, params wsParams) {
+func pumpWSConn(conn *websocket.Conn, sub *chat.WSConnection, tokenExp time.Time, params wsParams, validators ...func([]byte) bool) {
 	deadline := time.Now().Add(params.connLifetime)
 	if !tokenExp.IsZero() && tokenExp.Before(deadline) {
 		deadline = tokenExp
@@ -154,6 +164,10 @@ func pumpWSConn(conn *websocket.Conn, sub *chat.WSConnection, tokenExp time.Time
 				_ = conn.WriteControl(websocket.CloseMessage,
 					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shutdown"),
 					time.Now().Add(5*time.Second))
+				return
+			}
+			if len(validators) > 0 && !validators[0](payload) {
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "access requires revalidation"), time.Now().Add(5*time.Second))
 				return
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))

@@ -106,6 +106,9 @@ func (h *WSHub) ConnCount() int {
 // dievaluasi saat terhubung"). Any drift between the two is a leak-class
 // bug; the isolation tests pin both to the same matrix.
 func visibleFrozen(a Actor, c Conversation) bool {
+	if a.MembershipInactive {
+		return false
+	}
 	if a.UserID == uuid.Nil {
 		return false
 	}

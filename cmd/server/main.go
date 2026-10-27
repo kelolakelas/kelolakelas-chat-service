@@ -191,7 +191,7 @@ func main() {
 		slog.Error("academic client configuration invalid")
 		os.Exit(1)
 	}
-	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission, Academic: academicClient, Tenant: permission}, Secret: cfg.JWTSecret, InternalCredential: cfg.InternalCredential}
+	handler := chathttp.Handler{Service: chat.Service{Store: postgres.Store{DB: db}, Permission: permission, Membership: permission, Academic: academicClient, Tenant: permission}, Secret: cfg.JWTSecret, InternalCredential: cfg.InternalCredential}
 	// WS realtime (KEL-121): a process-local ticket store paired with an
 	// in-memory fan-out hub. serveUntilDone's graceful shutdown races the
 	// pump close frames; a dedicated hub.Close on shutdown gives WS clients

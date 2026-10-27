@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,53 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/kelolakelas/kelolakelas-chat-service/internal/chat"
 )
+
+type liveWSIdentity struct {
+	revoked    atomic.Bool
+	membership bool
+}
+
+func (p *liveWSIdentity) CheckPermission(context.Context, string, string, string, string) (bool, error) {
+	return !p.revoked.Load(), nil
+}
+func (p *liveWSIdentity) CheckActiveMembership(context.Context, string, string) (bool, error) {
+	return !p.membership || !p.revoked.Load(), nil
+}
+
+func TestWSRechecksAccessBeforeQueuedFrame(t *testing.T) {
+	for _, kind := range []string{"staff", "schedule_request"} {
+		t.Run(kind, func(t *testing.T) {
+			user, tenant, parent := uuid.New(), uuid.New(), uuid.New()
+			conv := chat.Conversation{ID: uuid.New(), TenantID: tenant, Kind: kind, MemberUserID: &user, ParentUserID: &parent}
+			identity := &liveWSIdentity{membership: kind == "staff"}
+			h := wsFixture(conv, wsPerm{"chat:manage": true})
+			h.Service.Permission = identity
+			h.Service.Membership = identity
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+			auth := signed(user.String(), tenant.String(), uuid.NewString(), uuid.NewString(), false)
+			conn := dialWS(t, srv, issueWSTicket(t, h, auth))
+			defer conn.Close()
+			deadline := time.Now().Add(time.Second)
+			for h.Hub.ConnCount() != 1 {
+				if time.Now().After(deadline) {
+					t.Fatal("WS not registered")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			identity.revoked.Store(true)
+			h.Hub.BroadcastMessage(conv, chat.Message{ID: uuid.New(), ConversationID: conv.ID, Body: "must not leak", CreatedAt: time.Now()})
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, payload, err := conn.ReadMessage()
+			if err == nil {
+				t.Fatalf("revoked connection received %s", payload)
+			}
+			if !websocket.IsCloseError(err, websocket.ClosePolicyViolation) {
+				t.Fatalf("wanted live authorization close, got %v", err)
+			}
+		})
+	}
+}
 
 // wsPerm answers identity permission checks from a static matrix.
 type wsPerm map[string]bool

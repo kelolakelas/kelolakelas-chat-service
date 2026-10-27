@@ -61,9 +61,9 @@ func TestHandlerSecurity(t *testing.T) {
 	}{
 		{"missing user", "GET", url, signed("", tenant.String(), "", "", false), "", 401},
 		{"missing tenant", "GET", url, signed(member.String(), "", "", "", false), "", 401},
-		{"not visible", "GET", url, auth, "", 404},
-		{"permission unavailable list", "GET", "/api/v1/chat/conversations", auth, "", 200},
-		{"permission unavailable send", "POST", url + "/messages", auth, `{"body":"hi","client_message_id":"k"}`, 404},
+		{"permission unavailable detail", "GET", url, auth, "", 503},
+		{"permission unavailable list", "GET", "/api/v1/chat/conversations", auth, "", 503},
+		{"permission unavailable send", "POST", url + "/messages", auth, `{"body":"hi","client_message_id":"k"}`, 503},
 		{"invalid id", "GET", "/api/v1/chat/conversations/not-uuid", auth, "", 400},
 		{"empty body", "POST", url + "/messages", signed(owner.String(), tenant.String(), "", "", false), `{"body":" ","client_message_id":"k"}`, 400},
 		{"parent invisible", "GET", url, signed(uuid.NewString(), "", "", "", true), "", 404},

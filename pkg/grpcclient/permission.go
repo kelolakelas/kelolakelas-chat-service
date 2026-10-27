@@ -2,6 +2,7 @@ package grpcclient
 
 import (
 	"context"
+	"errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -21,6 +22,27 @@ func New(target string, timeout time.Duration) (*Client, error) {
 	return &Client{conn: conn, timeout: timeout}, nil
 }
 func (c *Client) Close() error { return c.conn.Close() }
+func (c *Client) CheckActiveMembership(ctx context.Context, tenant, member string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	req, err := structpb.NewStruct(map[string]any{"tenant_id": tenant, "member_id": member})
+	if err != nil {
+		return false, err
+	}
+	resp := new(structpb.Struct)
+	if err = c.conn.Invoke(ctx, "/tenant.MembershipService/CheckActiveMembership", req, resp, grpc.StaticMethod()); err != nil {
+		return false, err
+	}
+	value, ok := resp.GetFields()["active"]
+	if !ok {
+		return false, errors.New("invalid membership response")
+	}
+	result, ok := value.Kind.(*structpb.Value_BoolValue)
+	if !ok {
+		return false, errors.New("invalid membership response")
+	}
+	return result.BoolValue, nil
+}
 func (c *Client) CheckPermission(ctx context.Context, tenant, role, member, permission string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -33,5 +55,12 @@ func (c *Client) CheckPermission(ctx context.Context, tenant, role, member, perm
 		return false, err
 	}
 	value, ok := resp.GetFields()["allowed"]
-	return ok && value.GetBoolValue(), nil
+	if !ok {
+		return false, errors.New("invalid permission response")
+	}
+	result, ok := value.Kind.(*structpb.Value_BoolValue)
+	if !ok {
+		return false, errors.New("invalid permission response")
+	}
+	return result.BoolValue, nil
 }
